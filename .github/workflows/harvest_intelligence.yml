@@ -2,7 +2,8 @@ name: Harvest Financial Intelligence
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    # 24x7 Continuous Execution: Runs every 5 minutes around the clock
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 concurrency:
