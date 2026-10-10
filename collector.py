@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import re
+import time
 import json
 import shutil
 import hashlib
@@ -20,6 +21,11 @@ if not VAULT_PAT:
 
 VAULT_REPO_URL = f"https://x-access-token:{VAULT_PAT}@github.com/parshant65-lang/market-intelligence-vault.git"
 VAULT_DIR = "vault_storage"
+BUFFER_DIR = "local_hourly_buffer"
+
+SESSION_MAX_SECONDS = 5 * 3600 + 30 * 60  # Run for 5.5 hours continuously before seamless relay
+POLL_INTERVAL_SECONDS = 60                 # Poll live feeds every 60 seconds
+PUSH_INTERVAL_SECONDS = 3600               # Commit and push accumulated batch every 1 hour
 
 CHANNELS = [
     {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "full_text": True},
@@ -87,7 +93,6 @@ def extract_article_details(url, domain):
         with urllib.request.urlopen(req, timeout=7) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
-        # 1. Extract clean paragraphs
         raw_paras = re.findall(r"<p[^>]*>(.*?)</p>", html)
         clean_paras = []
         for p in raw_paras:
@@ -95,7 +100,6 @@ def extract_article_details(url, domain):
             if len(txt) > 75 and not any(bp in txt.lower() for bp in BLACKLIST_PHRASES):
                 clean_paras.append(txt)
 
-        # 2. Extract related links (Spider Graph)
         raw_links = re.findall(r'href=["\'](https?://[^"\'\s<>]+|/[^"\'\s<>]+)["\']', html)
         related_links = []
         seen = set()
@@ -132,7 +136,6 @@ def fetch_feed_items(ch):
         root = ET.fromstring(content)
         items = []
         now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        
         for it in root.findall(".//item"):
             title = clean_html(it.findtext("title", ""))
             link = it.findtext("link", "").strip()
@@ -169,16 +172,23 @@ def fetch_feed_items(ch):
     except Exception:
         return []
 
-def main():
-    print("[1/6] Ingesting multi-channel market feeds...")
-    all_raw_items = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(fetch_feed_items, ch) for ch in CHANNELS]
-        for f in as_completed(futures):
-            all_raw_items.extend(f.result())
-    print(f"      Fetched {len(all_raw_items)} items across {len(CHANNELS)} channels.")
+def flush_buffer_to_vault():
+    buffer_file = os.path.join(BUFFER_DIR, "buffered_items.json")
+    if not os.path.exists(buffer_file):
+        print("[HOURLY SYNC] Buffer is empty. Zero new items to push.")
+        return
 
-    print("[2/6] Connecting to private intelligence vault...")
+    try:
+        with open(buffer_file, "r", encoding="utf-8") as f:
+            buffered_items = json.load(f)
+    except Exception:
+        buffered_items = []
+
+    if not buffered_items:
+        print("[HOURLY SYNC] Buffer contains 0 items. Skipping push.")
+        return
+
+    print(f"\n[HOURLY SYNC] Initiating 1-Hour Flush: {len(buffered_items)} accumulated items to private vault...")
     if os.path.exists(VAULT_DIR):
         shutil.rmtree(VAULT_DIR)
 
@@ -187,24 +197,24 @@ def main():
         capture_output=True, text=True
     )
     if clone_res.returncode != 0:
-        print("[ERROR] Failed to clone vault repository.")
-        sys.exit(1)
+        print("[HOURLY SYNC ERROR] Failed to connect to vault repository.")
+        return
 
-    # Load master link registry
-    link_registry_path = os.path.join(VAULT_DIR, "data", "link_registry.json")
-    link_registry = {"total_discovered": 0, "total_ingested": 0, "links": {}}
-    if os.path.exists(link_registry_path):
+    # Update Link Registry
+    link_reg_path = os.path.join(VAULT_DIR, "data", "link_registry.json")
+    link_reg = {"total_discovered": 0, "total_ingested": 0, "links": {}}
+    if os.path.exists(link_reg_path):
         try:
-            with open(link_registry_path, "r", encoding="utf-8") as f:
-                link_registry = json.load(f)
+            with open(link_reg_path, "r", encoding="utf-8") as f:
+                link_reg = json.load(f)
         except Exception:
             pass
 
-    print("[3/6] Deduplicating and identifying new articles...")
-    items_to_process = []
-    known_existing = {}
+    # Group by target JSON file
+    file_groups = {}
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    for item in all_raw_items:
+    for item in buffered_items:
         category = item["category"]
         pub_dt = item["published_utc"].split(" ")[0]
         try:
@@ -218,70 +228,40 @@ def main():
         os.makedirs(target_folder, exist_ok=True)
         file_path = os.path.join(target_folder, f"{category}_{pub_dt}.json")
 
-        if file_path not in known_existing:
-            existing_records = []
+        if file_path not in file_groups:
+            existing = []
             known_ids = set()
             known_urls = set()
             if os.path.exists(file_path):
                 try:
                     with open(file_path, "r", encoding="utf-8") as f:
-                        existing_records = json.load(f)
-                    for e in existing_records:
+                        existing = json.load(f)
+                    for e in existing:
                         known_ids.add(e.get("id"))
                         known_urls.add(e.get("url"))
                 except Exception:
-                    existing_records = []
-            known_existing[file_path] = (existing_records, known_ids, known_urls)
+                    existing = []
+            file_groups[file_path] = (existing, known_ids, known_urls)
 
-        ex_records, known_ids, known_urls = known_existing[file_path]
+        ex_records, known_ids, known_urls = file_groups[file_path]
         if item["id"] not in known_ids and item["url"] not in known_urls:
-            items_to_process.append((file_path, item))
+            ex_records.append(item)
             known_ids.add(item["id"])
             known_urls.add(item["url"])
 
-    print(f"      Identified {len(items_to_process)} brand-new articles to process.")
-
-    print("[4/6] Extracting body paragraphs and related links (Spider Crawler)...")
-    def enrich_item(entry):
-        file_path, item = entry
-        domain = item.pop("domain", "")
-        if item.pop("can_full_text", False):
-            paras, rel_links = extract_article_details(item["url"], domain)
-            item["full_content"] = paras
-            item["related_links"] = rel_links
-            if paras:
-                full_text_sample = " ".join(paras[:5])
-                sc, lb = score_sentiment(f"{item['title']} {item['description']} {full_text_sample}")
-                item["sentiment"] = {"score": sc, "label": lb}
-        else:
-            item.pop("can_full_text", None)
-            item["full_content"] = [item["description"]] if item["description"] else []
-            item["related_links"] = []
-        return file_path, item
-
-    enriched_items = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(enrich_item, entry) for entry in items_to_process]
-        for f in as_completed(futures):
-            enriched_items.append(f.result())
-
-    # Update Link Registry with both ingested and discovered related links
-    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    for file_path, item in enriched_items:
-        # Register main article as ingested
-        link_registry["links"][item["url"]] = {
+        # Update link registry
+        link_reg["links"][item["url"]] = {
             "title": item["title"],
             "source": item["source"],
             "category": item["category"],
             "published_utc": item["published_utc"],
             "discovered_utc": now_str,
             "status": "ingested",
-            "related_count": len(item.get("related_links", []))
+            "has_full_content": len(item.get("full_content", [])) > 0
         }
-        # Register discovered related links
         for r_link in item.get("related_links", []):
-            if r_link not in link_registry["links"]:
-                link_registry["links"][r_link] = {
+            if r_link not in link_reg["links"]:
+                link_reg["links"][r_link] = {
                     "source": item["source"],
                     "category": item["category"],
                     "parent_url": item["url"],
@@ -289,44 +269,140 @@ def main():
                     "status": "discovered"
                 }
 
-    link_registry["total_discovered"] = len(link_registry["links"])
-    link_registry["total_ingested"] = sum(1 for v in link_registry["links"].values() if v.get("status") == "ingested")
-
-    # Save link_registry.json
-    os.makedirs(os.path.dirname(link_registry_path), exist_ok=True)
-    with open(link_registry_path, "w", encoding="utf-8") as f:
-        json.dump(link_registry, f, indent=2, ensure_ascii=False)
-
-    for file_path, item in enriched_items:
-        ex_records, _, _ = known_existing[file_path]
-        ex_records.append(item)
-
-    for file_path, (records, _, _) in known_existing.items():
+    # Save data files
+    for file_path, (records, _, _) in file_groups.items():
         if records:
             records.sort(key=lambda x: x["published_utc"], reverse=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(records, f, indent=2, ensure_ascii=False)
 
-    print("[5/6] Syncing updates and Link Registry to private vault...")
+    link_reg["total_discovered"] = len(link_reg["links"])
+    link_reg["total_ingested"] = sum(1 for v in link_reg["links"].values() if v.get("status") == "ingested")
+
+    with open(link_reg_path, "w", encoding="utf-8") as f:
+        json.dump(link_reg, f, indent=2, ensure_ascii=False)
+
+    # Git Commit and Push to Vault
     subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=VAULT_DIR, check=True)
     subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=VAULT_DIR, check=True)
     subprocess.run(["git", "add", "data/"], cwd=VAULT_DIR, check=True)
     commit_res = subprocess.run(
-        ["git", "commit", "-m", f"Ingest: {len(enriched_items)} articles + Link Registry updated ({link_registry['total_discovered']} total links) [skip ci]"],
+        ["git", "commit", "-m", f"Hourly sync: {len(buffered_items)} articles + Link Registry ({link_reg['total_discovered']} links) [skip ci]"],
         cwd=VAULT_DIR, capture_output=True, text=True
     )
     if commit_res.returncode == 0:
         push_res = subprocess.run(["git", "push", "origin", "main"], cwd=VAULT_DIR, capture_output=True, text=True)
         if push_res.returncode == 0:
-            print(f"      Successfully synced articles and link registry to vault.")
+            print(f"[HOURLY SYNC] Successfully synced {len(buffered_items)} articles to private vault.")
         else:
-            print(f"[ERROR] Push failed: {push_res.stderr.strip()}")
-    else:
-        print("      Vault already up to date. Zero changes.")
+            print(f"[HOURLY SYNC ERROR] Push failed: {push_res.stderr.strip()}")
 
-    print("[6/6] Sanitizing runner environment...")
+    # Cleanup local vault and buffer
     shutil.rmtree(VAULT_DIR, ignore_errors=True)
-    print(f"[SUCCESS] Spider cycle complete. Registry contains {link_registry['total_discovered']} tracked links.")
+    shutil.rmtree(BUFFER_DIR, ignore_errors=True)
+    print("[HOURLY SYNC] Local buffer deleted. Runner memory clean.")
+
+def trigger_next_relay():
+    url = "https://api.github.com/repos/parshant65-lang/market-data-engine/actions/workflows/harvest_intelligence.yml/dispatches"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"ref": "main"}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {VAULT_PAT}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Continuous-Relay"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print("[SEAMLESS RELAY] Successfully handed off and triggered next continuous session.")
+    except Exception as e:
+        print(f"[RELAY DISPATCH ERROR] {e}")
+
+def main():
+    print("=" * 70)
+    print("🚀 CONTINUOUS 24x7 MARKET INTELLIGENCE ENGINE INITIALIZED")
+    print(f"   Target Duration: {SESSION_MAX_SECONDS // 3600}h {SESSION_MAX_SECONDS % 3600 // 60}m")
+    print(f"   Feed Check Cadence: Every {POLL_INTERVAL_SECONDS}s")
+    print(f"   Vault Push Cadence: Every {PUSH_INTERVAL_SECONDS // 3600} Hour (with auto-delete)")
+    print("=" * 70)
+
+    os.makedirs(BUFFER_DIR, exist_ok=True)
+    seen_ids_in_session = set()
+    start_time = time.time()
+    last_push_time = time.time()
+
+    while (time.time() - start_time) < SESSION_MAX_SECONDS:
+        current_time = time.time()
+        now_dt = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
+
+        # 1. Fetch live items from feeds
+        feed_items = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(fetch_feed_items, ch) for ch in CHANNELS]
+            for f in as_completed(futures):
+                feed_items.extend(f.result())
+
+        # 2. Identify brand-new items unseen in this session
+        new_items = []
+        for it in feed_items:
+            if it["id"] not in seen_ids_in_session:
+                new_items.append(it)
+                seen_ids_in_session.add(it["id"])
+
+        # 3. Enrich new items with full text and related links
+        if new_items:
+            print(f"[{now_dt}] Discovered {len(new_items)} fresh articles. Extracting full content...")
+            def enrich(item):
+                domain = item.pop("domain", "")
+                if item.pop("can_full_text", False):
+                    paras, rel_links = extract_article_details(item["url"], domain)
+                    item["full_content"] = paras
+                    item["related_links"] = rel_links
+                    if paras:
+                        full_sample = " ".join(paras[:5])
+                        sc, lb = score_sentiment(f"{item['title']} {item['description']} {full_sample}")
+                        item["sentiment"] = {"score": sc, "label": lb}
+                else:
+                    item.pop("can_full_text", None)
+                    item["full_content"] = [item["description"]] if item["description"] else []
+                    item["related_links"] = []
+                return item
+
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                enriched = list(executor.map(enrich, new_items))
+
+            # Append to local hourly buffer
+            buffer_file = os.path.join(BUFFER_DIR, "buffered_items.json")
+            existing_buffer = []
+            if os.path.exists(buffer_file):
+                try:
+                    with open(buffer_file, "r", encoding="utf-8") as f:
+                        existing_buffer = json.load(f)
+                except Exception:
+                    existing_buffer = []
+
+            existing_buffer.extend(enriched)
+            os.makedirs(BUFFER_DIR, exist_ok=True)
+            with open(buffer_file, "w", encoding="utf-8") as f:
+                json.dump(existing_buffer, f, ensure_ascii=False)
+
+            print(f"[{now_dt}] Buffered {len(enriched)} articles. Current hour buffer size: {len(existing_buffer)}.")
+
+        # 4. Check if 1 hour has elapsed for push & delete
+        if (current_time - last_push_time) >= PUSH_INTERVAL_SECONDS:
+            flush_buffer_to_vault()
+            last_push_time = time.time()
+
+        # Sleep before next poll
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    # End of session: Flush any remaining items, dispatch next relay, clean up
+    print("\n[SESSION COMPLETE] Flushing final buffer before handoff...")
+    flush_buffer_to_vault()
+    trigger_next_relay()
+    shutil.rmtree(BUFFER_DIR, ignore_errors=True)
+    print("🏁 Runner finished session cleanly. Next continuous runner dispatched.")
 
 if __name__ == "__main__":
     main()

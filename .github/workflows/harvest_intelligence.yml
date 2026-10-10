@@ -2,8 +2,8 @@ name: Harvest Financial Intelligence
 
 on:
   schedule:
-    # 24x7 Continuous Execution: Runs every 5 minutes around the clock
-    - cron: '*/5 * * * *'
+    # Backup heartbeat trigger every 6 hours
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -13,6 +13,7 @@ concurrency:
 jobs:
   harvest:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout Engine Repository
         uses: actions/checkout@v4
@@ -22,7 +23,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run Market Intelligence Harvester
+      - name: Run Continuous Market Intelligence Engine
         env:
           VAULT_PAT: ${{ secrets.VAULT_PAT }}
         run: python collector.py
