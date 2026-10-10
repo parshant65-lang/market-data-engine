@@ -25,11 +25,7 @@ CHANNELS = [
     {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "full_text": True},
     {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html", "full_text": True},
     {"category": "coindesk", "source": "CoinDesk", "domain": "coindesk.com", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "full_text": True},
-    {"category": "cointelegraph", "source": "CoinTelegraph", "domain": "cointelegraph.com", "url": "https://cointelegraph.com/rss", "full_text": True},
-    {"category": "ft_markets", "source": "Financial Times", "domain": "ft.com", "url": "https://www.ft.com/rss/markets", "full_text": False},
-    {"category": "ft_fastft", "source": "Financial Times", "domain": "ft.com", "url": "https://www.ft.com/fastft?format=rss", "full_text": False},
-    {"category": "ft_global_economy", "source": "Financial Times", "domain": "ft.com", "url": "https://www.ft.com/global-economy?format=rss", "full_text": False},
-    {"category": "ft_cryptofinance", "source": "Financial Times", "domain": "ft.com", "url": "https://www.ft.com/cryptofinance?format=rss", "full_text": False}
+    {"category": "cointelegraph", "source": "CoinTelegraph", "domain": "cointelegraph.com", "url": "https://cointelegraph.com/rss", "full_text": True}
 ]
 
 BULLISH_WORDS = {
