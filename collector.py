@@ -8,10 +8,12 @@ import shutil
 import hashlib
 import datetime
 import subprocess
+import html as html_lib
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections import deque
 from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
 
 VAULT_PAT = os.environ.get("VAULT_PAT")
@@ -23,15 +25,15 @@ VAULT_REPO_URL = f"https://x-access-token:{VAULT_PAT}@github.com/parshant65-lang
 VAULT_DIR = "vault_storage"
 BUFFER_DIR = "local_hourly_buffer"
 
-SESSION_MAX_SECONDS = 5 * 3600 + 30 * 60  # Run for 5.5 hours continuously before seamless relay
-POLL_INTERVAL_SECONDS = 60                 # Poll live feeds every 60 seconds
-PUSH_INTERVAL_SECONDS = 3600               # Commit and push accumulated batch every 1 hour
+SESSION_MAX_SECONDS = 5 * 3600 + 30 * 60  # 5.5 hours continuous session before handoff
+PUSH_INTERVAL_SECONDS = 3600               # Flush, commit, push & delete every 1 hour (3600s)
+CRAWL_DELAY_SECONDS = 1.5                  # Polite delay between page requests
 
 CHANNELS = [
-    {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "full_text": True},
-    {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html", "full_text": True},
-    {"category": "coindesk", "source": "CoinDesk", "domain": "coindesk.com", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "full_text": True},
-    {"category": "cointelegraph", "source": "CoinTelegraph", "domain": "cointelegraph.com", "url": "https://cointelegraph.com/rss", "full_text": True}
+    {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html"},
+    {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html"},
+    {"category": "coindesk", "source": "CoinDesk", "domain": "coindesk.com", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+    {"category": "cointelegraph", "source": "CoinTelegraph", "domain": "cointelegraph.com", "url": "https://cointelegraph.com/rss"}
 ]
 
 BULLISH_WORDS = {
@@ -58,6 +60,7 @@ def clean_html(raw_html):
     if not raw_html:
         return ""
     clean = re.sub(r"<[^>]+>", "", raw_html)
+    clean = html_lib.unescape(clean)
     return " ".join(clean.split())
 
 def score_sentiment(text):
@@ -84,15 +87,36 @@ def parse_pubdate(pubdate_str):
     except Exception:
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-def extract_article_details(url, domain):
+def extract_page_data(url, domain):
     try:
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
         )
-        with urllib.request.urlopen(req, timeout=7) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
+        # 1. Title
+        title = ""
+        og_t = re.search(r"""<meta\s+(?:property|name)=["\x27]og:title["\x27]\s+content=["\x27](.*?)["\x27]""", html)
+        if og_t:
+            title = clean_html(og_t.group(1))
+        if not title:
+            h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.DOTALL)
+            if h1:
+                title = clean_html(h1.group(1))
+        if not title:
+            t = re.search(r"<title>(.*?)</title>", html, re.DOTALL)
+            if t:
+                title = clean_html(t.group(1))
+
+        # 2. Date
+        pub_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        og_time = re.search(r"""<meta\s+(?:property|name)=["\x27](?:article:published_time|date)["\x27]\s+content=["\x27](.*?)["\x27]""", html)
+        if og_time:
+            pub_utc = parse_pubdate(og_time.group(1))
+
+        # 3. Clean Paragraphs
         raw_paras = re.findall(r"<p[^>]*>(.*?)</p>", html)
         clean_paras = []
         for p in raw_paras:
@@ -100,6 +124,7 @@ def extract_article_details(url, domain):
             if len(txt) > 75 and not any(bp in txt.lower() for bp in BLACKLIST_PHRASES):
                 clean_paras.append(txt)
 
+        # 4. Exponential Related Links (4 to 5 new links)
         raw_links = re.findall(r'href=["\'](https?://[^"\'\s<>]+|/[^"\'\s<>]+)["\']', html)
         related_links = []
         seen = set()
@@ -118,59 +143,31 @@ def extract_article_details(url, domain):
                 if re.search(r"/\d{4}/\d{2}/", path) or ("-" in path and len(path.strip("/").split("/")) >= 2):
                     related_links.append(full_url)
 
-        return clean_paras, related_links[:5]
+        return title, pub_utc, clean_paras, related_links[:5]
     except Exception:
-        return [], []
+        return "", "", [], []
 
-def fetch_feed_items(ch):
-    name = ch["category"]
-    url = ch["url"]
-    source = ch["source"]
-    domain = ch["domain"]
-    can_full_text = ch["full_text"]
-
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-    try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            content = resp.read()
-        root = ET.fromstring(content)
-        items = []
-        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        for it in root.findall(".//item"):
-            title = clean_html(it.findtext("title", ""))
-            link = it.findtext("link", "").strip()
-            desc = clean_html(it.findtext("description", ""))
-            pub_date = it.findtext("pubDate", "")
-            pub_utc = parse_pubdate(pub_date)
-
-            if not title or not link:
-                continue
-
-            unique_seed = f"{link}::{title}"
-            item_id = hashlib.md5(unique_seed.encode("utf-8")).hexdigest()
-            score, label = score_sentiment(f"{title} {desc}")
-
-            items.append({
-                "id": item_id,
-                "published_utc": pub_utc,
-                "source": source,
-                "category": name,
-                "domain": domain,
-                "title": title,
-                "description": desc,
-                "url": link,
-                "can_full_text": can_full_text,
-                "full_content": [],
-                "related_links": [],
-                "sentiment": {
-                    "score": score,
-                    "label": label
-                },
-                "ingested_utc": now_str
-            })
-        return items
-    except Exception:
-        return []
+def get_feed_seeds():
+    seeds = []
+    for ch in CHANNELS:
+        try:
+            req = urllib.request.Request(ch["url"], headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                root = ET.fromstring(r.read())
+            for it in root.findall(".//item")[:5]:
+                link = it.findtext("link", "").strip()
+                title = clean_html(it.findtext("title", ""))
+                if link:
+                    seeds.append({
+                        "url": link,
+                        "title": title,
+                        "source": ch["source"],
+                        "category": ch["category"],
+                        "domain": ch["domain"]
+                    })
+        except Exception:
+            pass
+    return seeds
 
 def flush_buffer_to_vault():
     buffer_file = os.path.join(BUFFER_DIR, "buffered_items.json")
@@ -188,7 +185,7 @@ def flush_buffer_to_vault():
         print("[HOURLY SYNC] Buffer contains 0 items. Skipping push.")
         return
 
-    print(f"\n[HOURLY SYNC] Initiating 1-Hour Flush: {len(buffered_items)} accumulated items to private vault...")
+    print(f"\n[HOURLY SYNC] Initiating 1-Hour Flush: {len(buffered_items)} accumulated articles to vault...")
     if os.path.exists(VAULT_DIR):
         shutil.rmtree(VAULT_DIR)
 
@@ -200,7 +197,6 @@ def flush_buffer_to_vault():
         print("[HOURLY SYNC ERROR] Failed to connect to vault repository.")
         return
 
-    # Update Link Registry
     link_reg_path = os.path.join(VAULT_DIR, "data", "link_registry.json")
     link_reg = {"total_discovered": 0, "total_ingested": 0, "links": {}}
     if os.path.exists(link_reg_path):
@@ -210,7 +206,6 @@ def flush_buffer_to_vault():
         except Exception:
             pass
 
-    # Group by target JSON file
     file_groups = {}
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -249,7 +244,7 @@ def flush_buffer_to_vault():
             known_ids.add(item["id"])
             known_urls.add(item["url"])
 
-        # Update link registry
+        # Update Master Link Registry
         link_reg["links"][item["url"]] = {
             "title": item["title"],
             "source": item["source"],
@@ -269,7 +264,6 @@ def flush_buffer_to_vault():
                     "status": "discovered"
                 }
 
-    # Save data files
     for file_path, (records, _, _) in file_groups.items():
         if records:
             records.sort(key=lambda x: x["published_utc"], reverse=True)
@@ -282,25 +276,23 @@ def flush_buffer_to_vault():
     with open(link_reg_path, "w", encoding="utf-8") as f:
         json.dump(link_reg, f, indent=2, ensure_ascii=False)
 
-    # Git Commit and Push to Vault
     subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=VAULT_DIR, check=True)
     subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=VAULT_DIR, check=True)
     subprocess.run(["git", "add", "data/"], cwd=VAULT_DIR, check=True)
     commit_res = subprocess.run(
-        ["git", "commit", "-m", f"Hourly sync: {len(buffered_items)} articles + Link Registry ({link_reg['total_discovered']} links) [skip ci]"],
+        ["git", "commit", "-m", f"Hourly sync: {len(buffered_items)} BFS articles + Link Registry ({link_reg['total_discovered']} links) [skip ci]"],
         cwd=VAULT_DIR, capture_output=True, text=True
     )
     if commit_res.returncode == 0:
         push_res = subprocess.run(["git", "push", "origin", "main"], cwd=VAULT_DIR, capture_output=True, text=True)
         if push_res.returncode == 0:
-            print(f"[HOURLY SYNC] Successfully synced {len(buffered_items)} articles to private vault.")
+            print(f"[HOURLY SYNC] Successfully synced {len(buffered_items)} articles to vault.")
         else:
             print(f"[HOURLY SYNC ERROR] Push failed: {push_res.stderr.strip()}")
 
-    # Cleanup local vault and buffer
     shutil.rmtree(VAULT_DIR, ignore_errors=True)
     shutil.rmtree(BUFFER_DIR, ignore_errors=True)
-    print("[HOURLY SYNC] Local buffer deleted. Runner memory clean.")
+    print("[HOURLY SYNC] Local buffer flushed & deleted. Storage 100% clean.")
 
 def trigger_next_relay():
     url = "https://api.github.com/repos/parshant65-lang/market-data-engine/actions/workflows/harvest_intelligence.yml/dispatches"
@@ -310,99 +302,123 @@ def trigger_next_relay():
         headers={
             "Authorization": f"Bearer {VAULT_PAT}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "Continuous-Relay"
+            "User-Agent": "Continuous-BFS-Spider"
         }
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            print("[SEAMLESS RELAY] Successfully handed off and triggered next continuous session.")
+            print("[SEAMLESS RELAY] Next continuous BFS spider dispatched successfully.")
     except Exception as e:
         print(f"[RELAY DISPATCH ERROR] {e}")
 
 def main():
     print("=" * 70)
-    print("🚀 CONTINUOUS 24x7 MARKET INTELLIGENCE ENGINE INITIALIZED")
-    print(f"   Target Duration: {SESSION_MAX_SECONDS // 3600}h {SESSION_MAX_SECONDS % 3600 // 60}m")
-    print(f"   Feed Check Cadence: Every {POLL_INTERVAL_SECONDS}s")
-    print(f"   Vault Push Cadence: Every {PUSH_INTERVAL_SECONDS // 3600} Hour (with auto-delete)")
+    print("🕷️ CONTINUOUS 24x7 EXPONENTIAL BFS TREE SPIDER INITIALIZED")
+    print("   Growth Architecture: 1 Article ➡️ 4 Links ➡️ 16 Links ➡️ 64 Links...")
+    print(f"   Max Session Time: {SESSION_MAX_SECONDS // 3600}h {SESSION_MAX_SECONDS % 3600 // 60}m")
+    print(f"   Hourly Flush Cadence: Every {PUSH_INTERVAL_SECONDS // 3600} Hour (with auto-delete)")
     print("=" * 70)
 
     os.makedirs(BUFFER_DIR, exist_ok=True)
-    seen_ids_in_session = set()
+    crawl_queue = deque()
+    visited_urls = set()
+
+    # Seed initial queue
+    initial_seeds = get_feed_seeds()
+    for s in initial_seeds:
+        crawl_queue.append(s)
+        visited_urls.add(s["url"])
+    print(f"[SEED] Initialized BFS Queue with {len(crawl_queue)} starting articles.")
+
     start_time = time.time()
     last_push_time = time.time()
+    articles_ingested_session = 0
 
     while (time.time() - start_time) < SESSION_MAX_SECONDS:
         current_time = time.time()
-        now_dt = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
 
-        # 1. Fetch live items from feeds
-        feed_items = []
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(fetch_feed_items, ch) for ch in CHANNELS]
-            for f in as_completed(futures):
-                feed_items.extend(f.result())
+        # If queue gets low, inject fresh seeds
+        if len(crawl_queue) < 4:
+            new_seeds = get_feed_seeds()
+            for s in new_seeds:
+                if s["url"] not in visited_urls:
+                    crawl_queue.append(s)
+                    visited_urls.add(s["url"])
 
-        # 2. Identify brand-new items unseen in this session
-        new_items = []
-        for it in feed_items:
-            if it["id"] not in seen_ids_in_session:
-                new_items.append(it)
-                seen_ids_in_session.add(it["id"])
+        if crawl_queue:
+            current_target = crawl_queue.popleft()
+            url = current_target["url"]
+            source = current_target["source"]
+            category = current_target["category"]
+            domain = current_target["domain"]
 
-        # 3. Enrich new items with full text and related links
-        if new_items:
-            print(f"[{now_dt}] Discovered {len(new_items)} fresh articles. Extracting full content...")
-            def enrich(item):
-                domain = item.pop("domain", "")
-                if item.pop("can_full_text", False):
-                    paras, rel_links = extract_article_details(item["url"], domain)
-                    item["full_content"] = paras
-                    item["related_links"] = rel_links
-                    if paras:
-                        full_sample = " ".join(paras[:5])
-                        sc, lb = score_sentiment(f"{item['title']} {item['description']} {full_sample}")
-                        item["sentiment"] = {"score": sc, "label": lb}
-                else:
-                    item.pop("can_full_text", None)
-                    item["full_content"] = [item["description"]] if item["description"] else []
-                    item["related_links"] = []
-                return item
+            title, pub_utc, paras, related_links = extract_page_data(url, domain)
 
-            with ThreadPoolExecutor(max_workers=6) as executor:
-                enriched = list(executor.map(enrich, new_items))
+            if paras:
+                articles_ingested_session += 1
+                unique_seed = f"{url}::{title}"
+                item_id = hashlib.md5(unique_seed.encode("utf-8")).hexdigest()
+                sample_text = " ".join(paras[:5])
+                score, label = score_sentiment(f"{title} {sample_text}")
 
-            # Append to local hourly buffer
-            buffer_file = os.path.join(BUFFER_DIR, "buffered_items.json")
-            existing_buffer = []
-            if os.path.exists(buffer_file):
-                try:
-                    with open(buffer_file, "r", encoding="utf-8") as f:
-                        existing_buffer = json.load(f)
-                except Exception:
-                    existing_buffer = []
+                article_record = {
+                    "id": item_id,
+                    "published_utc": pub_utc,
+                    "source": source,
+                    "category": category,
+                    "title": title,
+                    "description": paras[0] if paras else "",
+                    "url": url,
+                    "full_content": paras,
+                    "related_links": related_links,
+                    "sentiment": {
+                        "score": score,
+                        "label": label
+                    },
+                    "ingested_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                }
 
-            existing_buffer.extend(enriched)
-            os.makedirs(BUFFER_DIR, exist_ok=True)
-            with open(buffer_file, "w", encoding="utf-8") as f:
-                json.dump(existing_buffer, f, ensure_ascii=False)
+                # Save to local hourly buffer
+                buffer_file = os.path.join(BUFFER_DIR, "buffered_items.json")
+                buf = []
+                if os.path.exists(buffer_file):
+                    try:
+                        with open(buffer_file, "r", encoding="utf-8") as f:
+                            buf = json.load(f)
+                    except Exception:
+                        buf = []
+                buf.append(article_record)
+                os.makedirs(BUFFER_DIR, exist_ok=True)
+                with open(buffer_file, "w", encoding="utf-8") as f:
+                    json.dump(buf, f, ensure_ascii=False)
 
-            print(f"[{now_dt}] Buffered {len(enriched)} articles. Current hour buffer size: {len(existing_buffer)}.")
+                now_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")
+                print(f"[{now_ts}] [BFS #{articles_ingested_session}] {title[:55]}... ({len(paras)} paras) -> +{len(related_links)} new links (Q: {len(crawl_queue)})")
 
-        # 4. Check if 1 hour has elapsed for push & delete
+                # Push newly discovered links into BFS Queue (1 -> 4 -> 16 -> 64 expansion!)
+                for r_url in related_links:
+                    if r_url not in visited_urls:
+                        visited_urls.add(r_url)
+                        crawl_queue.append({
+                            "url": r_url,
+                            "source": source,
+                            "category": category,
+                            "domain": domain
+                        })
+
+            time.sleep(CRAWL_DELAY_SECONDS)
+
+        # Check 1-Hour Push Cadence
         if (current_time - last_push_time) >= PUSH_INTERVAL_SECONDS:
             flush_buffer_to_vault()
             last_push_time = time.time()
 
-        # Sleep before next poll
-        time.sleep(POLL_INTERVAL_SECONDS)
-
-    # End of session: Flush any remaining items, dispatch next relay, clean up
-    print("\n[SESSION COMPLETE] Flushing final buffer before handoff...")
+    # End of Session Handoff
+    print("\n[SESSION COMPLETE] Flushing remaining buffer and launching next relay...")
     flush_buffer_to_vault()
     trigger_next_relay()
     shutil.rmtree(BUFFER_DIR, ignore_errors=True)
-    print("🏁 Runner finished session cleanly. Next continuous runner dispatched.")
+    print("🏁 BFS Spider relay handover complete.")
 
 if __name__ == "__main__":
     main()
