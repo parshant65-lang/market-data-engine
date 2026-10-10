@@ -124,7 +124,7 @@ def extract_page_data(url, domain):
             if len(txt) > 75 and not any(bp in txt.lower() for bp in BLACKLIST_PHRASES):
                 clean_paras.append(txt)
 
-        # 4. Exponential Related Links (4 to 5 new links)
+        # 4. Exponential Related Links (Strict Real Article Filter)
         raw_links = re.findall(r'href=["\'](https?://[^"\'\s<>]+|/[^"\'\s<>]+)["\']', html)
         related_links = []
         seen = set()
@@ -135,13 +135,19 @@ def extract_page_data(url, domain):
             seen.add(full_url)
             parsed = urlparse(full_url)
             if domain in parsed.netloc:
-                path = parsed.path
-                if re.search(r"^/(de|es|fr|fil|id|it|ja|ko|ru|zh|pt|ar)/", path):
+                path = parsed.path.lower()
+                if any(path.endswith(ext) for ext in [".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".css", ".js", ".json"]):
                     continue
-                if any(skip in path for skip in ["/video/", "/watch/", "/pro/", "/live-tv/", "/author/", "/tag/", "/privacy", "/terms", "/amp/", "/podcast/"]):
+                if re.search(r"^/(de|es|fr|fil|id|it|ja|ko|ru|zh|pt|pt-br|nl|uk|ar|tr|pl)/", path):
                     continue
-                if re.search(r"/\d{4}/\d{2}/", path) or ("-" in path and len(path.strip("/").split("/")) >= 2):
-                    related_links.append(full_url)
+                if any(skip in path for skip in ["/api/", "/favicons/", "/amp/", "/video/", "/watch/", "/pro/", "/live-tv/", "/author/", "/tag/", "/privacy", "/terms", "/investingclub/"]):
+                    continue
+                if "cnbc.com" in domain:
+                    if path.endswith(".html") and (re.search(r"/\d{4}/\d{2}/", path) or "/markets/" in path or "/economy/" in path):
+                        related_links.append(full_url)
+                else:
+                    if any(cat in path for cat in ["/markets/", "/business/", "/policy/", "/tech/", "/news/"]) and len(path.strip("/").split("/")) >= 3:
+                        related_links.append(full_url)
 
         return title, pub_utc, clean_paras, related_links[:5]
     except Exception:
