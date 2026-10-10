@@ -9,6 +9,7 @@ import datetime
 import subprocess
 import urllib.request
 import xml.etree.ElementTree as ET
+from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 
@@ -21,14 +22,14 @@ VAULT_REPO_URL = f"https://x-access-token:{VAULT_PAT}@github.com/parshant65-lang
 VAULT_DIR = "vault_storage"
 
 CHANNELS = [
-    {"category": "cnbc_markets", "source": "CNBC", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "full_text": True},
-    {"category": "cnbc_economy", "source": "CNBC", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html", "full_text": True},
-    {"category": "coindesk", "source": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "full_text": True},
-    {"category": "cointelegraph", "source": "CoinTelegraph", "url": "https://cointelegraph.com/rss", "full_text": True},
-    {"category": "ft_markets", "source": "Financial Times", "url": "https://www.ft.com/rss/markets", "full_text": False},
-    {"category": "ft_fastft", "source": "Financial Times", "url": "https://www.ft.com/fastft?format=rss", "full_text": False},
-    {"category": "ft_global_economy", "source": "Financial Times", "url": "https://www.ft.com/global-economy?format=rss", "full_text": False},
-    {"category": "ft_cryptofinance", "source": "Financial Times", "url": "https://www.ft.com/cryptofinance?format=rss", "full_text": False}
+    {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "full_text": True},
+    {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html", "full_text": True},
+    {"category": "coindesk", "source": "CoinDesk", "domain": "coindesk.com", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "full_text": True},
+    {"category": "cointelegraph", "source": "CoinTelegraph", "domain": "cointelegraph.com", "url": "https://cointelegraph.com/rss", "full_text": True},
+    {"category": "ft_markets", "source": "Financial Times", "domain": "ft.com", "url": "https://www.ft.com/rss/markets", "full_text": False},
+    {"category": "ft_fastft", "source": "Financial Times", "domain": "ft.com", "url": "https://www.ft.com/fastft?format=rss", "full_text": False},
+    {"category": "ft_global_economy", "source": "Financial Times", "domain": "ft.com", "url": "https://www.ft.com/global-economy?format=rss", "full_text": False},
+    {"category": "ft_cryptofinance", "source": "Financial Times", "domain": "ft.com", "url": "https://www.ft.com/cryptofinance?format=rss", "full_text": False}
 ]
 
 BULLISH_WORDS = {
@@ -81,7 +82,7 @@ def parse_pubdate(pubdate_str):
     except Exception:
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-def extract_full_article_body(url):
+def extract_article_details(url, domain):
     try:
         req = urllib.request.Request(
             url,
@@ -90,23 +91,45 @@ def extract_full_article_body(url):
         with urllib.request.urlopen(req, timeout=7) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
+        # 1. Extract clean paragraphs
         raw_paras = re.findall(r"<p[^>]*>(.*?)</p>", html)
         clean_paras = []
         for p in raw_paras:
             txt = clean_html(p)
             if len(txt) > 75 and not any(bp in txt.lower() for bp in BLACKLIST_PHRASES):
                 clean_paras.append(txt)
-        return clean_paras
+
+        # 2. Extract related links (Spider Graph)
+        raw_links = re.findall(r'href=["\'](https?://[^"\'\s<>]+|/[^"\'\s<>]+)["\']', html)
+        related_links = []
+        seen = set()
+        for l in raw_links:
+            full_url = urljoin(url, l).split("?")[0].split("#")[0]
+            if full_url in seen or full_url == url:
+                continue
+            seen.add(full_url)
+            parsed = urlparse(full_url)
+            if domain in parsed.netloc:
+                path = parsed.path
+                if re.search(r"^/(de|es|fr|fil|id|it|ja|ko|ru|zh|pt|ar)/", path):
+                    continue
+                if any(skip in path for skip in ["/video/", "/watch/", "/pro/", "/live-tv/", "/author/", "/tag/", "/privacy", "/terms", "/amp/", "/podcast/"]):
+                    continue
+                if re.search(r"/\d{4}/\d{2}/", path) or ("-" in path and len(path.strip("/").split("/")) >= 2):
+                    related_links.append(full_url)
+
+        return clean_paras, related_links[:5]
     except Exception:
-        return []
+        return [], []
 
 def fetch_feed_items(ch):
     name = ch["category"]
     url = ch["url"]
     source = ch["source"]
+    domain = ch["domain"]
     can_full_text = ch["full_text"]
 
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
             content = resp.read()
@@ -133,11 +156,13 @@ def fetch_feed_items(ch):
                 "published_utc": pub_utc,
                 "source": source,
                 "category": name,
+                "domain": domain,
                 "title": title,
                 "description": desc,
                 "url": link,
                 "can_full_text": can_full_text,
                 "full_content": [],
+                "related_links": [],
                 "sentiment": {
                     "score": score,
                     "label": label
@@ -149,7 +174,7 @@ def fetch_feed_items(ch):
         return []
 
 def main():
-    print("[1/5] Ingesting multi-channel market intelligence feeds...")
+    print("[1/6] Ingesting multi-channel market feeds...")
     all_raw_items = []
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(fetch_feed_items, ch) for ch in CHANNELS]
@@ -157,7 +182,7 @@ def main():
             all_raw_items.extend(f.result())
     print(f"      Fetched {len(all_raw_items)} items across {len(CHANNELS)} channels.")
 
-    print("[2/5] Connecting to private intelligence vault...")
+    print("[2/6] Connecting to private intelligence vault...")
     if os.path.exists(VAULT_DIR):
         shutil.rmtree(VAULT_DIR)
 
@@ -169,7 +194,17 @@ def main():
         print("[ERROR] Failed to clone vault repository.")
         sys.exit(1)
 
-    print("[3/5] Deduplicating and identifying new articles...")
+    # Load master link registry
+    link_registry_path = os.path.join(VAULT_DIR, "data", "link_registry.json")
+    link_registry = {"total_discovered": 0, "total_ingested": 0, "links": {}}
+    if os.path.exists(link_registry_path):
+        try:
+            with open(link_registry_path, "r", encoding="utf-8") as f:
+                link_registry = json.load(f)
+        except Exception:
+            pass
+
+    print("[3/6] Deduplicating and identifying new articles...")
     items_to_process = []
     known_existing = {}
 
@@ -208,14 +243,16 @@ def main():
             known_ids.add(item["id"])
             known_urls.add(item["url"])
 
-    print(f"      Identified {len(items_to_process)} brand-new articles to ingest.")
+    print(f"      Identified {len(items_to_process)} brand-new articles to process.")
 
-    print("[4/5] Extracting full body paragraphs for new articles (ThreadPool)...")
+    print("[4/6] Extracting body paragraphs and related links (Spider Crawler)...")
     def enrich_item(entry):
         file_path, item = entry
+        domain = item.pop("domain", "")
         if item.pop("can_full_text", False):
-            paras = extract_full_article_body(item["url"])
+            paras, rel_links = extract_article_details(item["url"], domain)
             item["full_content"] = paras
+            item["related_links"] = rel_links
             if paras:
                 full_text_sample = " ".join(paras[:5])
                 sc, lb = score_sentiment(f"{item['title']} {item['description']} {full_text_sample}")
@@ -223,6 +260,7 @@ def main():
         else:
             item.pop("can_full_text", None)
             item["full_content"] = [item["description"]] if item["description"] else []
+            item["related_links"] = []
         return file_path, item
 
     enriched_items = []
@@ -230,6 +268,38 @@ def main():
         futures = [executor.submit(enrich_item, entry) for entry in items_to_process]
         for f in as_completed(futures):
             enriched_items.append(f.result())
+
+    # Update Link Registry with both ingested and discovered related links
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    for file_path, item in enriched_items:
+        # Register main article as ingested
+        link_registry["links"][item["url"]] = {
+            "title": item["title"],
+            "source": item["source"],
+            "category": item["category"],
+            "published_utc": item["published_utc"],
+            "discovered_utc": now_str,
+            "status": "ingested",
+            "related_count": len(item.get("related_links", []))
+        }
+        # Register discovered related links
+        for r_link in item.get("related_links", []):
+            if r_link not in link_registry["links"]:
+                link_registry["links"][r_link] = {
+                    "source": item["source"],
+                    "category": item["category"],
+                    "parent_url": item["url"],
+                    "discovered_utc": now_str,
+                    "status": "discovered"
+                }
+
+    link_registry["total_discovered"] = len(link_registry["links"])
+    link_registry["total_ingested"] = sum(1 for v in link_registry["links"].values() if v.get("status") == "ingested")
+
+    # Save link_registry.json
+    os.makedirs(os.path.dirname(link_registry_path), exist_ok=True)
+    with open(link_registry_path, "w", encoding="utf-8") as f:
+        json.dump(link_registry, f, indent=2, ensure_ascii=False)
 
     for file_path, item in enriched_items:
         ex_records, _, _ = known_existing[file_path]
@@ -241,26 +311,26 @@ def main():
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(records, f, indent=2, ensure_ascii=False)
 
-    print(f"[5/5] Syncing enriched dataset to private vault...")
-    if len(enriched_items) > 0:
-        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=VAULT_DIR, check=True)
-        subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=VAULT_DIR, check=True)
-        subprocess.run(["git", "add", "data/"], cwd=VAULT_DIR, check=True)
-        commit_res = subprocess.run(
-            ["git", "commit", "-m", f"Ingest: {len(enriched_items)} full-text market intelligence records [skip ci]"],
-            cwd=VAULT_DIR, capture_output=True, text=True
-        )
-        if commit_res.returncode == 0:
-            push_res = subprocess.run(["git", "push", "origin", "main"], cwd=VAULT_DIR, capture_output=True, text=True)
-            if push_res.returncode == 0:
-                print(f"      Successfully synced {len(enriched_items)} full-content articles to vault.")
-            else:
-                print(f"[ERROR] Push failed: {push_res.stderr.strip()}")
+    print("[5/6] Syncing updates and Link Registry to private vault...")
+    subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=VAULT_DIR, check=True)
+    subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=VAULT_DIR, check=True)
+    subprocess.run(["git", "add", "data/"], cwd=VAULT_DIR, check=True)
+    commit_res = subprocess.run(
+        ["git", "commit", "-m", f"Ingest: {len(enriched_items)} articles + Link Registry updated ({link_registry['total_discovered']} total links) [skip ci]"],
+        cwd=VAULT_DIR, capture_output=True, text=True
+    )
+    if commit_res.returncode == 0:
+        push_res = subprocess.run(["git", "push", "origin", "main"], cwd=VAULT_DIR, capture_output=True, text=True)
+        if push_res.returncode == 0:
+            print(f"      Successfully synced articles and link registry to vault.")
+        else:
+            print(f"[ERROR] Push failed: {push_res.stderr.strip()}")
     else:
         print("      Vault already up to date. Zero changes.")
 
+    print("[6/6] Sanitizing runner environment...")
     shutil.rmtree(VAULT_DIR, ignore_errors=True)
-    print(f"[SUCCESS] Cycle complete. Full-content articles archived: {len(enriched_items)}.")
+    print(f"[SUCCESS] Spider cycle complete. Registry contains {link_registry['total_discovered']} tracked links.")
 
 if __name__ == "__main__":
     main()
