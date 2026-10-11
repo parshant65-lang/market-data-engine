@@ -30,6 +30,7 @@ BATCH_SIZE = 100                            # Process batches of 100 URLs from r
 NUM_WORKERS = 20                            # 20 parallel threads for fast cloud extraction
 
 CHANNELS = [
+    # CNBC Feeds (US Macro & Global)
     {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html"},
     {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html"},
     {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10001147/device/rss/rss.html"},
@@ -38,8 +39,24 @@ CHANNELS = [
     {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html"},
     {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000115/device/rss/rss.html"},
     {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/21324812/device/rss/rss.html"},
+
+    # Crypto & Digital Assets
     {"category": "coindesk", "source": "CoinDesk", "domain": "coindesk.com", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
-    {"category": "cointelegraph", "source": "CoinTelegraph", "domain": "cointelegraph.com", "url": "https://cointelegraph.com/rss"}
+    {"category": "cointelegraph", "source": "CoinTelegraph", "domain": "cointelegraph.com", "url": "https://cointelegraph.com/rss"},
+    {"category": "decrypt", "source": "Decrypt", "domain": "decrypt.co", "url": "https://decrypt.co/feed"},
+
+    # US Stocks & Breaking Equities
+    {"category": "benzinga", "source": "Benzinga", "domain": "benzinga.com", "url": "https://www.benzinga.com/feed"},
+    {"category": "yahoo_finance", "source": "Yahoo Finance", "domain": "finance.yahoo.com", "url": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,^DJI,^IXIC,AAPL,MSFT,NVDA,GOOGL,AMZN,TSLA&region=US&lang=en-US"},
+
+    # Indian Equities & Macro Policy
+    {"category": "livemint", "source": "Livemint", "domain": "livemint.com", "url": "https://www.livemint.com/rss/markets"},
+    {"category": "livemint", "source": "Livemint", "domain": "livemint.com", "url": "https://www.livemint.com/rss/companies"},
+    {"category": "moneycontrol", "source": "Moneycontrol", "domain": "moneycontrol.com", "url": "https://www.moneycontrol.com/rss/MCtopnews.xml"},
+    {"category": "moneycontrol", "source": "Moneycontrol", "domain": "moneycontrol.com", "url": "https://www.moneycontrol.com/rss/latestnews.xml"},
+    {"category": "moneycontrol", "source": "Moneycontrol", "domain": "moneycontrol.com", "url": "https://www.moneycontrol.com/rss/business.xml"},
+    {"category": "economic_times", "source": "Economic Times", "domain": "economictimes.indiatimes.com", "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"},
+    {"category": "economic_times", "source": "Economic Times", "domain": "economictimes.indiatimes.com", "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"}
 ]
 
 CNBC_HUBS = [
@@ -127,16 +144,20 @@ def extract_article_details(url, domain):
 
         # 2. Date
         pub_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        og_time = re.search(r"""<meta\s+(?:property|name)=["\x27](?:article:published_time|date)["\x27]\s+content=["\x27](.*?)["\x27]""", html)
+        og_time = re.search(r"""<meta\s+(?:property|name)=["\x27](?:article:published_time|date|publishdate|lastmod)["\x27]\s+content=["\x27](.*?)["\x27]""", html, re.IGNORECASE)
         if og_time:
             pub_utc = parse_pubdate(og_time.group(1))
+        else:
+            time_tag = re.search(r"""<time[^>]+datetime=["\x27](.*?)["\x27]""", html)
+            if time_tag:
+                pub_utc = parse_pubdate(time_tag.group(1))
 
         # 3. Clean Paragraphs
         raw_paras = re.findall(r"<p[^>]*>(.*?)</p>", html)
         clean_paras = []
         for p in raw_paras:
             txt = clean_html(p)
-            if len(txt) > 75 and not any(bp in txt.lower() for bp in BLACKLIST_PHRASES):
+            if len(txt) > 70 and not any(bp in txt.lower() for bp in BLACKLIST_PHRASES):
                 clean_paras.append(txt)
 
         # 4. Filtered Related Links
@@ -163,6 +184,24 @@ def extract_article_details(url, domain):
                     if path.endswith(".html") and not any(skip in path for skip in ["/privacy", "/terms", "/disclaimer", "/site-map", "/help"]):
                         if re.search(r"/\d{4}/\d{2}/", path) or any(cat in path for cat in ["/markets", "/economy", "/finance", "/investing", "/wealth", "/business", "/technology", "/real-estate", "/personal-finance", "/world"]):
                             related_links.append(full_url)
+                elif "benzinga.com" in domain:
+                    if any(cat in path for cat in ["/money/", "/markets/", "/news/", "/trading/"]) and len(path.strip("/").split("/")) >= 2:
+                        related_links.append(full_url)
+                elif "livemint.com" in domain:
+                    if any(cat in path for cat in ["/market/", "/companies/", "/money/", "/industry/", "/economy/"]) and len(path.strip("/").split("/")) >= 2:
+                        related_links.append(full_url)
+                elif "moneycontrol.com" in domain:
+                    if any(cat in path for cat in ["/news/business/", "/news/market/", "/news/economy/", "/news/local-markets/"]) or ("news" in path and ".html" in path):
+                        related_links.append(full_url)
+                elif "indiatimes.com" in domain:
+                    if "/markets/" in path and ("articleshow" in path or ".cms" in path or len(path.strip("/").split("/")) >= 2):
+                        related_links.append(full_url)
+                elif "decrypt.co" in domain:
+                    if re.search(r"/\d+/", path) or any(cat in path for cat in ["/news/", "/market/"]):
+                        related_links.append(full_url)
+                elif "yahoo.com" in domain:
+                    if "/news/" in path or len(path.strip("/").split("/")) >= 2:
+                        related_links.append(full_url)
                 else:
                     if any(cat in path for cat in ["/markets/", "/business/", "/policy/", "/tech/", "/news/"]) and len(path.strip("/").split("/")) >= 3:
                         related_links.append(full_url)
