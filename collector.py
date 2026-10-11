@@ -24,6 +24,7 @@ BUFFER_DIR = "local_spider_buffer"
 SESSION_MAX_SECONDS = 5 * 3600 + 30 * 60   # 5.5 Hours continuous session
 PUSH_INTERVAL_SECONDS = 900                 # Exactly 15 MINUTES sync cadence
 NUM_WORKERS = 20                            # 20 parallel spider threads
+MAX_LINKS_PER_PART = 100_000                # 1 Lakh URLs cap per registry volume
 
 CHANNELS = [
     # CNBC Feeds (US Macro & Global)
@@ -179,6 +180,18 @@ def get_feed_seeds():
 
     return seeds
 
+def get_registry_parts(vault_data_dir):
+    files = []
+    if os.path.exists(vault_data_dir):
+        for fname in os.listdir(vault_data_dir):
+            m = re.match(r"^link_registry_part(\d+)\.json$", fname)
+            if m:
+                files.append((int(m.group(1)), fname, os.path.join(vault_data_dir, fname)))
+    if not files:
+        fallback_path = os.path.join(vault_data_dir, "link_registry_part1.json")
+        return [(1, "link_registry_part1.json", fallback_path)]
+    return sorted(files, key=lambda x: x[0])
+
 def sync_spider_links_to_vault():
     buffer_file = os.path.join(BUFFER_DIR, "spider_new_links.json")
     if not os.path.exists(buffer_file):
@@ -205,35 +218,93 @@ def sync_spider_links_to_vault():
         print("[SPIDER SYNC ERROR] Failed to connect to vault.")
         return
 
-    link_reg_path = os.path.join(VAULT_DIR, "data", "link_registry.json")
-    link_reg = {"total_discovered": 0, "total_ingested": 0, "links": {}}
-    if os.path.exists(link_reg_path):
+    data_dir = os.path.join(VAULT_DIR, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    parts = get_registry_parts(data_dir)
+
+    # 1. Collect all existing URLs across all volumes to prevent duplicates
+    known_urls = set()
+    for _, _, fpath in parts:
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    part_data = json.load(f)
+                    known_urls.update(part_data.get("links", {}).keys())
+            except Exception:
+                pass
+
+    # 2. Select active (highest) volume
+    active_part_num, active_fname, active_fpath = parts[-1]
+    active_data = {"part": active_part_num, "total_discovered": 0, "total_ingested": 0, "links": {}}
+    if os.path.exists(active_fpath):
         try:
-            with open(link_reg_path, "r", encoding="utf-8") as f:
-                link_reg = json.load(f)
+            with open(active_fpath, "r", encoding="utf-8") as f:
+                active_data = json.load(f)
         except Exception:
             pass
 
+    if "links" not in active_data:
+        active_data["links"] = {}
+
+    # 3. Add fresh URLs, rolling over when 100,000 threshold is reached
     added_count = 0
+    modified_files = set()
+
     for url, meta in new_links.items():
-        if url not in link_reg["links"]:
-            link_reg["links"][url] = meta
-            added_count += 1
-        # If url already in link_reg, NEVER overwrite status if already ingested
-        elif link_reg["links"][url].get("status") == "discovered" and meta.get("title"):
-            link_reg["links"][url]["title"] = meta["title"]
+        if url in known_urls:
+            continue
 
-    link_reg["total_discovered"] = len(link_reg["links"])
-    link_reg["total_ingested"] = sum(1 for v in link_reg["links"].values() if v.get("status") == "ingested")
+        # If current volume reached 100k, seal it and roll over to the next volume
+        if len(active_data["links"]) >= MAX_LINKS_PER_PART:
+            active_data["total_discovered"] = len(active_data["links"])
+            active_data["total_ingested"] = sum(1 for v in active_data["links"].values() if v.get("status") == "ingested")
+            with open(active_fpath, "w", encoding="utf-8") as f:
+                json.dump(active_data, f, indent=2, ensure_ascii=False)
+            modified_files.add(active_fpath)
+            print(f"[CAP REACHED] {active_fname} reached {MAX_LINKS_PER_PART} URLs. Sealing volume.")
 
-    with open(link_reg_path, "w", encoding="utf-8") as f:
-        json.dump(link_reg, f, indent=2, ensure_ascii=False)
+            active_part_num += 1
+            active_fname = f"link_registry_part{active_part_num}.json"
+            active_fpath = os.path.join(data_dir, active_fname)
+            print(f"[ROLLOVER] Initialized new volume: {active_fname}")
+            active_data = {
+                "part": active_part_num,
+                "created_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "total_discovered": 0,
+                "total_ingested": 0,
+                "links": {}
+            }
 
+        active_data["links"][url] = meta
+        known_urls.add(url)
+        added_count += 1
+
+    # 4. Save the active volume
+    active_data["total_discovered"] = len(active_data["links"])
+    active_data["total_ingested"] = sum(1 for v in active_data["links"].values() if v.get("status") == "ingested")
+    with open(active_fpath, "w", encoding="utf-8") as f:
+        json.dump(active_data, f, indent=2, ensure_ascii=False)
+    modified_files.add(active_fpath)
+
+    # 5. Git Commit & Push
     subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=VAULT_DIR, check=True)
     subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=VAULT_DIR, check=True)
-    subprocess.run(["git", "add", "data/link_registry.json"], cwd=VAULT_DIR, check=True)
+
+    # Also clean up legacy link_registry.json if present
+    legacy_file = os.path.join(data_dir, "link_registry.json")
+    if os.path.exists(legacy_file):
+        try:
+            os.remove(legacy_file)
+            subprocess.run(["git", "rm", "-f", "data/link_registry.json"], cwd=VAULT_DIR, capture_output=True)
+        except Exception:
+            pass
+
+    for mf in modified_files:
+        rel_path = os.path.relpath(mf, VAULT_DIR)
+        subprocess.run(["git", "add", rel_path], cwd=VAULT_DIR, check=True)
+
     commit_res = subprocess.run(
-        ["git", "commit", "-m", f"Spider sync: +{added_count} discovered links (Total: {link_reg['total_discovered']}) [skip ci]"],
+        ["git", "commit", "-m", f"Spider sync: +{added_count} links (Part {active_part_num}: {len(active_data['links'])}/{MAX_LINKS_PER_PART}) [skip ci]"],
         cwd=VAULT_DIR, capture_output=True, text=True
     )
     if commit_res.returncode == 0:
