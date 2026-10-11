@@ -407,6 +407,7 @@ def main():
     os.makedirs(BUFFER_DIR, exist_ok=True)
     start_time = time.time()
     last_push_time = time.time()
+    last_seed_time = 0
     total_session_ingested = 0
 
     while (time.time() - start_time) < SESSION_MAX_SECONDS:
@@ -426,30 +427,49 @@ def main():
             except Exception:
                 pass
 
-        # Identify pending URLs (status == discovered)
-        pending_items = []
-        for url, meta in registry.get("links", {}).items():
-            if meta.get("status") == "discovered":
-                parsed = urlparse(url)
-                pending_items.append({
-                    "url": url,
-                    "source": meta.get("source", "Unknown"),
-                    "category": meta.get("category", "markets"),
-                    "domain": parsed.netloc
-                })
-                if len(pending_items) >= BATCH_SIZE:
-                    break
-
-        shutil.rmtree(VAULT_DIR, ignore_errors=True)
-
-        # If pending links < 20, fetch fresh seeds from RSS feeds
-        if len(pending_items) < 20:
+        # 1. Periodically inject fresh seeds from all 9 sources (on startup and every 30 mins)
+        new_seeds_added = []
+        if (current_time - last_seed_time) >= 1800 or total_session_ingested == 0:
             seeds = get_feed_seeds()
+            now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             for s in seeds:
                 if s["url"] not in registry.get("links", {}):
-                    pending_items.append(s)
-                if len(pending_items) >= BATCH_SIZE:
-                    break
+                    registry.setdefault("links", {})[s["url"]] = {
+                        "source": s["source"],
+                        "category": s["category"],
+                        "title": s.get("title", ""),
+                        "discovered_utc": now_iso,
+                        "status": "discovered"
+                    }
+                    new_seeds_added.append(s)
+            if new_seeds_added:
+                print(f"[SEEDS INJECTED] Added {len(new_seeds_added)} fresh multi-source breaking seeds into registry.")
+            last_seed_time = current_time
+
+        # 2. Balanced Multi-Source Round-Robin batch selection (100 URLs across all categories)
+        by_cat = {}
+        for url, meta in registry.get("links", {}).items():
+            if meta.get("status") == "discovered":
+                c = meta.get("category", "cnbc_markets")
+                parsed = urlparse(url)
+                by_cat.setdefault(c, []).append({
+                    "url": url,
+                    "source": meta.get("source", "Unknown"),
+                    "category": c,
+                    "domain": parsed.netloc
+                })
+
+        pending_items = []
+        categories = list(by_cat.keys())
+        while len(pending_items) < BATCH_SIZE and any(by_cat.values()):
+            for c in categories:
+                if by_cat[c]:
+                    item = by_cat[c].pop(0)
+                    pending_items.append(item)
+                    if len(pending_items) >= BATCH_SIZE:
+                        break
+
+        shutil.rmtree(VAULT_DIR, ignore_errors=True)
 
         if pending_items:
             now_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
@@ -513,6 +533,17 @@ def main():
                         existing_reg_up = {}
 
                 now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                if new_seeds_added:
+                    for s in new_seeds_added:
+                        if s["url"] not in existing_reg_up:
+                            existing_reg_up[s["url"]] = {
+                                "source": s["source"],
+                                "category": s["category"],
+                                "title": s.get("title", ""),
+                                "discovered_utc": now_iso,
+                                "status": "discovered"
+                            }
+
                 for art in batch_results:
                     url = art["url"]
                     existing_reg_up[url] = {
