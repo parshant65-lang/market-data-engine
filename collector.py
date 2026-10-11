@@ -11,9 +11,8 @@ import subprocess
 import html as html_lib
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections import deque
 from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 
 VAULT_PAT = os.environ.get("VAULT_PAT")
@@ -23,11 +22,12 @@ if not VAULT_PAT:
 
 VAULT_REPO_URL = f"https://x-access-token:{VAULT_PAT}@github.com/parshant65-lang/market-intelligence-vault.git"
 VAULT_DIR = "vault_storage"
-BUFFER_DIR = "local_hourly_buffer"
+BUFFER_DIR = "local_batch_buffer"
 
-SESSION_MAX_SECONDS = 5 * 3600 + 30 * 60  # 5.5 hours continuous session before handoff
-PUSH_INTERVAL_SECONDS = 3600               # Flush, commit, push & delete every 1 hour (3600s)
-CRAWL_DELAY_SECONDS = 1.5                  # Polite delay between page requests
+SESSION_MAX_SECONDS = 5 * 3600 + 30 * 60   # 5.5 Hours continuous session before relay handoff
+PUSH_INTERVAL_SECONDS = 1800                # Exactly 30 MINUTES (1800s) push cadence
+BATCH_SIZE = 100                            # Process batches of 100 URLs from registry
+NUM_WORKERS = 20                            # 20 parallel threads for fast cloud extraction
 
 CHANNELS = [
     {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html"},
@@ -87,7 +87,7 @@ def parse_pubdate(pubdate_str):
     except Exception:
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-def extract_page_data(url, domain):
+def extract_article_details(url, domain):
     try:
         req = urllib.request.Request(
             url,
@@ -124,7 +124,7 @@ def extract_page_data(url, domain):
             if len(txt) > 75 and not any(bp in txt.lower() for bp in BLACKLIST_PHRASES):
                 clean_paras.append(txt)
 
-        # 4. Exponential Related Links (Strict Real Article Filter)
+        # 4. Filtered Related Links
         raw_links = re.findall(r'href=["\'](https?://[^"\'\s<>]+|/[^"\'\s<>]+)["\']', html)
         related_links = []
         seen = set()
@@ -160,7 +160,7 @@ def get_feed_seeds():
             req = urllib.request.Request(ch["url"], headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 root = ET.fromstring(r.read())
-            for it in root.findall(".//item")[:5]:
+            for it in root.findall(".//item")[:10]:
                 link = it.findtext("link", "").strip()
                 title = clean_html(it.findtext("title", ""))
                 if link:
@@ -175,10 +175,12 @@ def get_feed_seeds():
             pass
     return seeds
 
-def flush_buffer_to_vault():
+def sync_batch_to_vault():
     buffer_file = os.path.join(BUFFER_DIR, "buffered_items.json")
+    registry_updates_file = os.path.join(BUFFER_DIR, "registry_updates.json")
+
     if not os.path.exists(buffer_file):
-        print("[HOURLY SYNC] Buffer is empty. Zero new items to push.")
+        print("[30-MIN SYNC] Buffer is empty. Zero new items to push.")
         return
 
     try:
@@ -187,11 +189,17 @@ def flush_buffer_to_vault():
     except Exception:
         buffered_items = []
 
+    try:
+        with open(registry_updates_file, "r", encoding="utf-8") as f:
+            registry_updates = json.load(f)
+    except Exception:
+        registry_updates = {}
+
     if not buffered_items:
-        print("[HOURLY SYNC] Buffer contains 0 items. Skipping push.")
+        print("[30-MIN SYNC] Buffer contains 0 items. Skipping push.")
         return
 
-    print(f"\n[HOURLY SYNC] Initiating 1-Hour Flush: {len(buffered_items)} accumulated articles to vault...")
+    print(f"\n[30-MIN SYNC] Initiating 30-Minute Vault Sync: {len(buffered_items)} articles to vault...")
     if os.path.exists(VAULT_DIR):
         shutil.rmtree(VAULT_DIR)
 
@@ -200,9 +208,10 @@ def flush_buffer_to_vault():
         capture_output=True, text=True
     )
     if clone_res.returncode != 0:
-        print("[HOURLY SYNC ERROR] Failed to connect to vault repository.")
+        print("[30-MIN SYNC ERROR] Failed to connect to vault repository.")
         return
 
+    # 1. Update Master Link Registry
     link_reg_path = os.path.join(VAULT_DIR, "data", "link_registry.json")
     link_reg = {"total_discovered": 0, "total_ingested": 0, "links": {}}
     if os.path.exists(link_reg_path):
@@ -212,9 +221,11 @@ def flush_buffer_to_vault():
         except Exception:
             pass
 
-    file_groups = {}
-    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    for url, info in registry_updates.items():
+        link_reg["links"][url] = info
 
+    # 2. Partition into Category Date Files
+    file_groups = {}
     for item in buffered_items:
         category = item["category"]
         pub_dt = item["published_utc"].split(" ")[0]
@@ -250,26 +261,6 @@ def flush_buffer_to_vault():
             known_ids.add(item["id"])
             known_urls.add(item["url"])
 
-        # Update Master Link Registry
-        link_reg["links"][item["url"]] = {
-            "title": item["title"],
-            "source": item["source"],
-            "category": item["category"],
-            "published_utc": item["published_utc"],
-            "discovered_utc": now_str,
-            "status": "ingested",
-            "has_full_content": len(item.get("full_content", [])) > 0
-        }
-        for r_link in item.get("related_links", []):
-            if r_link not in link_reg["links"]:
-                link_reg["links"][r_link] = {
-                    "source": item["source"],
-                    "category": item["category"],
-                    "parent_url": item["url"],
-                    "discovered_utc": now_str,
-                    "status": "discovered"
-                }
-
     for file_path, (records, _, _) in file_groups.items():
         if records:
             records.sort(key=lambda x: x["published_utc"], reverse=True)
@@ -282,23 +273,24 @@ def flush_buffer_to_vault():
     with open(link_reg_path, "w", encoding="utf-8") as f:
         json.dump(link_reg, f, indent=2, ensure_ascii=False)
 
+    # 3. Git Commit and Push to Vault
     subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=VAULT_DIR, check=True)
     subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], cwd=VAULT_DIR, check=True)
     subprocess.run(["git", "add", "data/"], cwd=VAULT_DIR, check=True)
     commit_res = subprocess.run(
-        ["git", "commit", "-m", f"Hourly sync: {len(buffered_items)} BFS articles + Link Registry ({link_reg['total_discovered']} links) [skip ci]"],
+        ["git", "commit", "-m", f"30-Min sync: {len(buffered_items)} articles + Link Registry ({link_reg['total_discovered']} links) [skip ci]"],
         cwd=VAULT_DIR, capture_output=True, text=True
     )
     if commit_res.returncode == 0:
         push_res = subprocess.run(["git", "push", "origin", "main"], cwd=VAULT_DIR, capture_output=True, text=True)
         if push_res.returncode == 0:
-            print(f"[HOURLY SYNC] Successfully synced {len(buffered_items)} articles to vault.")
+            print(f"[30-MIN SYNC] Successfully synced {len(buffered_items)} articles to vault.")
         else:
-            print(f"[HOURLY SYNC ERROR] Push failed: {push_res.stderr.strip()}")
+            print(f"[30-MIN SYNC ERROR] Push failed: {push_res.stderr.strip()}")
 
     shutil.rmtree(VAULT_DIR, ignore_errors=True)
     shutil.rmtree(BUFFER_DIR, ignore_errors=True)
-    print("[HOURLY SYNC] Local buffer flushed & deleted. Storage 100% clean.")
+    print("[30-MIN SYNC] Local buffer deleted. Runner storage 100% clean.")
 
 def trigger_next_relay():
     url = "https://api.github.com/repos/parshant65-lang/market-data-engine/actions/workflows/harvest_intelligence.yml/dispatches"
@@ -308,123 +300,172 @@ def trigger_next_relay():
         headers={
             "Authorization": f"Bearer {VAULT_PAT}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "Continuous-BFS-Spider"
+            "User-Agent": "Continuous-30m-Engine"
         }
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            print("[SEAMLESS RELAY] Next continuous BFS spider dispatched successfully.")
+            print("[SEAMLESS RELAY] Next continuous session triggered successfully.")
     except Exception as e:
         print(f"[RELAY DISPATCH ERROR] {e}")
 
 def main():
     print("=" * 70)
-    print("🕷️ CONTINUOUS 24x7 EXPONENTIAL BFS TREE SPIDER INITIALIZED")
-    print("   Growth Architecture: 1 Article ➡️ 4 Links ➡️ 16 Links ➡️ 64 Links...")
+    print("🚀 30-MINUTE BATCH MARKET INTELLIGENCE ENGINE INITIALIZED")
+    print(f"   Batch Size: {BATCH_SIZE} URLs parallel (20 ThreadPool Workers)")
+    print(f"   Vault Push Cadence: Exactly Every {PUSH_INTERVAL_SECONDS // 60} Minutes")
     print(f"   Max Session Time: {SESSION_MAX_SECONDS // 3600}h {SESSION_MAX_SECONDS % 3600 // 60}m")
-    print(f"   Hourly Flush Cadence: Every {PUSH_INTERVAL_SECONDS // 3600} Hour (with auto-delete)")
     print("=" * 70)
 
     os.makedirs(BUFFER_DIR, exist_ok=True)
-    crawl_queue = deque()
-    visited_urls = set()
-
-    # Seed initial queue
-    initial_seeds = get_feed_seeds()
-    for s in initial_seeds:
-        crawl_queue.append(s)
-        visited_urls.add(s["url"])
-    print(f"[SEED] Initialized BFS Queue with {len(crawl_queue)} starting articles.")
-
     start_time = time.time()
     last_push_time = time.time()
-    articles_ingested_session = 0
+    total_session_ingested = 0
 
     while (time.time() - start_time) < SESSION_MAX_SECONDS:
         current_time = time.time()
 
-        # If queue gets low, inject fresh seeds
-        if len(crawl_queue) < 4:
-            new_seeds = get_feed_seeds()
-            for s in new_seeds:
-                if s["url"] not in visited_urls:
-                    crawl_queue.append(s)
-                    visited_urls.add(s["url"])
+        # Connect and check pending links from registry
+        if os.path.exists(VAULT_DIR):
+            shutil.rmtree(VAULT_DIR)
+        subprocess.run(["git", "clone", "--depth", "1", VAULT_REPO_URL, VAULT_DIR], capture_output=True, text=True)
 
-        if crawl_queue:
-            current_target = crawl_queue.popleft()
-            url = current_target["url"]
-            source = current_target["source"]
-            category = current_target["category"]
-            domain = current_target["domain"]
+        link_reg_path = os.path.join(VAULT_DIR, "data", "link_registry.json")
+        registry = {"links": {}}
+        if os.path.exists(link_reg_path):
+            try:
+                with open(link_reg_path, "r", encoding="utf-8") as f:
+                    registry = json.load(f)
+            except Exception:
+                pass
 
-            title, pub_utc, paras, related_links = extract_page_data(url, domain)
-
-            if paras:
-                articles_ingested_session += 1
-                unique_seed = f"{url}::{title}"
-                item_id = hashlib.md5(unique_seed.encode("utf-8")).hexdigest()
-                sample_text = " ".join(paras[:5])
-                score, label = score_sentiment(f"{title} {sample_text}")
-
-                article_record = {
-                    "id": item_id,
-                    "published_utc": pub_utc,
-                    "source": source,
-                    "category": category,
-                    "title": title,
-                    "description": paras[0] if paras else "",
+        # Identify pending URLs (status == discovered)
+        pending_items = []
+        for url, meta in registry.get("links", {}).items():
+            if meta.get("status") == "discovered":
+                parsed = urlparse(url)
+                pending_items.append({
                     "url": url,
-                    "full_content": paras,
-                    "related_links": related_links,
-                    "sentiment": {
-                        "score": score,
-                        "label": label
-                    },
-                    "ingested_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                }
+                    "source": meta.get("source", "Unknown"),
+                    "category": meta.get("category", "markets"),
+                    "domain": parsed.netloc
+                })
+                if len(pending_items) >= BATCH_SIZE:
+                    break
 
-                # Save to local hourly buffer
+        shutil.rmtree(VAULT_DIR, ignore_errors=True)
+
+        # If pending links < 20, fetch fresh seeds from RSS feeds
+        if len(pending_items) < 20:
+            seeds = get_feed_seeds()
+            for s in seeds:
+                if s["url"] not in registry.get("links", {}):
+                    pending_items.append(s)
+                if len(pending_items) >= BATCH_SIZE:
+                    break
+
+        if pending_items:
+            now_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
+            print(f"\n[{now_ts}] Launching Parallel Batch: Processing {len(pending_items)} URLs with {NUM_WORKERS} workers...")
+
+            def process_target(target):
+                url = target["url"]
+                domain = target["domain"]
+                title, pub_utc, paras, rel_links = extract_article_details(url, domain)
+                if paras:
+                    unique_seed = f"{url}::{title}"
+                    item_id = hashlib.md5(unique_seed.encode("utf-8")).hexdigest()
+                    sample_text = " ".join(paras[:5])
+                    sc, lb = score_sentiment(f"{title} {sample_text}")
+                    return {
+                        "id": item_id,
+                        "published_utc": pub_utc,
+                        "source": target["source"],
+                        "category": target["category"],
+                        "title": title,
+                        "description": paras[0] if paras else "",
+                        "url": url,
+                        "full_content": paras,
+                        "related_links": rel_links,
+                        "sentiment": {"score": sc, "label": lb},
+                        "ingested_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                return None
+
+            batch_results = []
+            with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+                futures = [executor.submit(process_target, t) for t in pending_items]
+                for f in as_completed(futures):
+                    res = f.result()
+                    if res:
+                        batch_results.append(res)
+
+            if batch_results:
+                total_session_ingested += len(batch_results)
+                # Append to local buffer
                 buffer_file = os.path.join(BUFFER_DIR, "buffered_items.json")
-                buf = []
+                reg_updates_file = os.path.join(BUFFER_DIR, "registry_updates.json")
+
+                existing_buf = []
                 if os.path.exists(buffer_file):
                     try:
                         with open(buffer_file, "r", encoding="utf-8") as f:
-                            buf = json.load(f)
+                            existing_buf = json.load(f)
                     except Exception:
-                        buf = []
-                buf.append(article_record)
+                        existing_buf = []
+                existing_buf.extend(batch_results)
+
+                existing_reg_up = {}
+                if os.path.exists(reg_updates_file):
+                    try:
+                        with open(reg_updates_file, "r", encoding="utf-8") as f:
+                            existing_reg_up = json.load(f)
+                    except Exception:
+                        existing_reg_up = {}
+
+                now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                for r in batch_results:
+                    existing_reg_up[r["url"]] = {
+                        "title": r["title"],
+                        "source": r["source"],
+                        "category": r["category"],
+                        "published_utc": r["published_utc"],
+                        "discovered_utc": now_iso,
+                        "status": "ingested",
+                        "has_full_content": True
+                    }
+                    for rl in r.get("related_links", []):
+                        if rl not in existing_reg_up and rl not in registry.get("links", {}):
+                            existing_reg_up[rl] = {
+                                "source": r["source"],
+                                "category": r["category"],
+                                "parent_url": r["url"],
+                                "discovered_utc": now_iso,
+                                "status": "discovered"
+                            }
+
                 os.makedirs(BUFFER_DIR, exist_ok=True)
                 with open(buffer_file, "w", encoding="utf-8") as f:
-                    json.dump(buf, f, ensure_ascii=False)
+                    json.dump(existing_buf, f, ensure_ascii=False)
+                with open(reg_updates_file, "w", encoding="utf-8") as f:
+                    json.dump(existing_reg_up, f, ensure_ascii=False)
 
-                now_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")
-                print(f"[{now_ts}] [BFS #{articles_ingested_session}] {title[:55]}... ({len(paras)} paras) -> +{len(related_links)} new links (Q: {len(crawl_queue)})")
+                print(f"[{now_ts}] Batch Finished: +{len(batch_results)} articles extracted. (Buffered this 30m window: {len(existing_buf)})")
 
-                # Push newly discovered links into BFS Queue (1 -> 4 -> 16 -> 64 expansion!)
-                for r_url in related_links:
-                    if r_url not in visited_urls:
-                        visited_urls.add(r_url)
-                        crawl_queue.append({
-                            "url": r_url,
-                            "source": source,
-                            "category": category,
-                            "domain": domain
-                        })
-
-            time.sleep(CRAWL_DELAY_SECONDS)
-
-        # Check 1-Hour Push Cadence
-        if (current_time - last_push_time) >= PUSH_INTERVAL_SECONDS:
-            flush_buffer_to_vault()
+        # Check 30-Minute Push Trigger
+        if (time.time() - last_push_time) >= PUSH_INTERVAL_SECONDS:
+            sync_batch_to_vault()
             last_push_time = time.time()
 
+        # Rest between batches
+        time.sleep(15)
+
     # End of Session Handoff
-    print("\n[SESSION COMPLETE] Flushing remaining buffer and launching next relay...")
-    flush_buffer_to_vault()
+    print("\n[SESSION COMPLETE] Flushing final 30-min buffer and triggering next relay...")
+    sync_batch_to_vault()
     trigger_next_relay()
     shutil.rmtree(BUFFER_DIR, ignore_errors=True)
-    print("🏁 BFS Spider relay handover complete.")
+    print("🏁 30-Minute Engine session handover complete.")
 
 if __name__ == "__main__":
     main()
