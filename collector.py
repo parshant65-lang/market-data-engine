@@ -263,6 +263,8 @@ def sync_batch_to_vault():
 
     for file_path, (records, _, _) in file_groups.items():
         if records:
+            for r in records:
+                r.pop("related_links", None)
             records.sort(key=lambda x: x["published_utc"], reverse=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(records, f, indent=2, ensure_ascii=False)
@@ -377,7 +379,7 @@ def main():
                     item_id = hashlib.md5(unique_seed.encode("utf-8")).hexdigest()
                     sample_text = " ".join(paras[:5])
                     sc, lb = score_sentiment(f"{title} {sample_text}")
-                    return {
+                    article_item = {
                         "id": item_id,
                         "published_utc": pub_utc,
                         "source": target["source"],
@@ -386,19 +388,21 @@ def main():
                         "description": paras[0] if paras else "",
                         "url": url,
                         "full_content": paras,
-                        "related_links": rel_links,
                         "sentiment": {"score": sc, "label": lb},
                         "ingested_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                     }
-                return None
+                    return article_item, rel_links
+                return None, []
 
             batch_results = []
+            article_rel_map = {}
             with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
                 futures = [executor.submit(process_target, t) for t in pending_items]
                 for f in as_completed(futures):
-                    res = f.result()
-                    if res:
-                        batch_results.append(res)
+                    art, r_links = f.result()
+                    if art:
+                        batch_results.append(art)
+                        article_rel_map[art["url"]] = (art, r_links)
 
             if batch_results:
                 total_session_ingested += len(batch_results)
@@ -424,22 +428,24 @@ def main():
                         existing_reg_up = {}
 
                 now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                for r in batch_results:
-                    existing_reg_up[r["url"]] = {
-                        "title": r["title"],
-                        "source": r["source"],
-                        "category": r["category"],
-                        "published_utc": r["published_utc"],
+                for art in batch_results:
+                    url = art["url"]
+                    existing_reg_up[url] = {
+                        "title": art["title"],
+                        "source": art["source"],
+                        "category": art["category"],
+                        "published_utc": art["published_utc"],
                         "discovered_utc": now_iso,
                         "status": "ingested",
                         "has_full_content": True
                     }
-                    for rl in r.get("related_links", []):
+                    _, r_links = article_rel_map.get(url, (None, []))
+                    for rl in r_links:
                         if rl not in existing_reg_up and rl not in registry.get("links", {}):
                             existing_reg_up[rl] = {
-                                "source": r["source"],
-                                "category": r["category"],
-                                "parent_url": r["url"],
+                                "source": art["source"],
+                                "category": art["category"],
+                                "parent_url": url,
                                 "discovered_utc": now_iso,
                                 "status": "discovered"
                             }
