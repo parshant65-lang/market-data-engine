@@ -32,8 +32,23 @@ NUM_WORKERS = 20                            # 20 parallel threads for fast cloud
 CHANNELS = [
     {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html"},
     {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html"},
+    {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10001147/device/rss/rss.html"},
+    {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/19854910/device/rss/rss.html"},
+    {"category": "cnbc_markets", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/15839069/device/rss/rss.html"},
+    {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html"},
+    {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/10000115/device/rss/rss.html"},
+    {"category": "cnbc_economy", "source": "CNBC", "domain": "cnbc.com", "url": "https://www.cnbc.com/id/21324812/device/rss/rss.html"},
     {"category": "coindesk", "source": "CoinDesk", "domain": "coindesk.com", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
     {"category": "cointelegraph", "source": "CoinTelegraph", "domain": "cointelegraph.com", "url": "https://cointelegraph.com/rss"}
+]
+
+CNBC_HUBS = [
+    ("https://www.cnbc.com/markets/", "cnbc_markets"),
+    ("https://www.cnbc.com/economy/", "cnbc_economy"),
+    ("https://www.cnbc.com/investing/", "cnbc_markets"),
+    ("https://www.cnbc.com/technology/", "cnbc_markets"),
+    ("https://www.cnbc.com/finance/", "cnbc_markets"),
+    ("https://www.cnbc.com/world/", "cnbc_economy")
 ]
 
 BULLISH_WORDS = {
@@ -143,27 +158,33 @@ def extract_article_details(url, domain):
                 if any(skip in path for skip in ["/api/", "/favicons/", "/amp/", "/video/", "/watch/", "/pro/", "/live-tv/", "/author/", "/tag/", "/privacy", "/terms", "/investingclub/"]):
                     continue
                 if "cnbc.com" in domain:
-                    if path.endswith(".html") and (re.search(r"/\d{4}/\d{2}/", path) or "/markets/" in path or "/economy/" in path):
-                        related_links.append(full_url)
+                    if "/amp/" in full_url:
+                        full_url = full_url.replace("/amp/", "/")
+                    if path.endswith(".html") and not any(skip in path for skip in ["/privacy", "/terms", "/disclaimer", "/site-map", "/help"]):
+                        if re.search(r"/\d{4}/\d{2}/", path) or any(cat in path for cat in ["/markets", "/economy", "/finance", "/investing", "/wealth", "/business", "/technology", "/real-estate", "/personal-finance", "/world"]):
+                            related_links.append(full_url)
                 else:
                     if any(cat in path for cat in ["/markets/", "/business/", "/policy/", "/tech/", "/news/"]) and len(path.strip("/").split("/")) >= 3:
                         related_links.append(full_url)
 
-        return title, pub_utc, clean_paras, related_links[:5]
+        return title, pub_utc, clean_paras, related_links[:35]
     except Exception:
         return "", "", [], []
 
 def get_feed_seeds():
     seeds = []
+    seen = set()
+    # 1. RSS Feeds (Up to 25 per feed)
     for ch in CHANNELS:
         try:
-            req = urllib.request.Request(ch["url"], headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(ch["url"], headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 root = ET.fromstring(r.read())
-            for it in root.findall(".//item")[:10]:
+            for it in root.findall(".//item")[:25]:
                 link = it.findtext("link", "").strip()
                 title = clean_html(it.findtext("title", ""))
-                if link:
+                if link and link not in seen:
+                    seen.add(link)
                     seeds.append({
                         "url": link,
                         "title": title,
@@ -173,6 +194,31 @@ def get_feed_seeds():
                     })
         except Exception:
             pass
+
+    # 2. CNBC Category Hubs (Direct homepage/section article discovery)
+    for hub_url, category in CNBC_HUBS:
+        try:
+            req = urllib.request.Request(hub_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                html = r.read().decode("utf-8", errors="ignore")
+            raw_links = re.findall(r'href=["\'](https?://[^"\'\s<>]+|/[^"\'\s<>]+)["\']', html)
+            for l in raw_links:
+                full = urljoin(hub_url, l).split("?")[0].split("#")[0]
+                if "/amp/" in full:
+                    full = full.replace("/amp/", "/")
+                if "cnbc.com" in full and full.endswith(".html") and re.search(r"/\d{4}/\d{2}/", full):
+                    if full not in seen:
+                        seen.add(full)
+                        seeds.append({
+                            "url": full,
+                            "title": "",
+                            "source": "CNBC",
+                            "category": category,
+                            "domain": "cnbc.com"
+                        })
+        except Exception:
+            pass
+
     return seeds
 
 def sync_batch_to_vault():
