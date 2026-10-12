@@ -65,6 +65,15 @@ CNBC_HUBS = [
     ("https://www.cnbc.com/world/", "cnbc_economy")
 ]
 
+YAHOO_HUBS = [
+    ("https://finance.yahoo.com/topic/stock-market-news/", "yahoo_finance"),
+    ("https://finance.yahoo.com/topic/latest-news/", "yahoo_finance"),
+    ("https://finance.yahoo.com/topic/yahoo-finance-originals/", "yahoo_finance"),
+    ("https://finance.yahoo.com/topic/earnings/", "yahoo_finance"),
+    ("https://finance.yahoo.com/topic/tech/", "yahoo_finance"),
+    ("https://finance.yahoo.com/markets/", "yahoo_finance")
+]
+
 def clean_html(raw_html):
     if not raw_html:
         return ""
@@ -120,8 +129,9 @@ def extract_spider_links(url, domain):
                     if re.search(r"/\d+/", path) or any(cat in path for cat in ["/news/", "/market/"]):
                         related_links.append(full_url)
                 elif "yahoo.com" in domain:
-                    if "/news/" in path or len(path.strip("/").split("/")) >= 2:
-                        related_links.append(full_url)
+                    if ("/article/" in path or "/articles/" in path or path.endswith(".html")) and not any(skip in path for skip in ["/privacy", "/terms", "/disclaimer", "/help", "/screener", "/watchlists", "/compare"]):
+                        if not re.search(r"^/(topic|research-hub|sectors|markets)/?$", path):
+                            related_links.append(full_url)
                 else:
                     if any(cat in path for cat in ["/markets/", "/business/", "/policy/", "/tech/", "/news/"]) and len(path.strip("/").split("/")) >= 3:
                         related_links.append(full_url)
@@ -175,6 +185,32 @@ def get_feed_seeds():
                             "category": category,
                             "domain": "cnbc.com"
                         })
+        except Exception:
+            pass
+
+    # 3. Yahoo Finance Category Hubs
+    for hub_url, category in YAHOO_HUBS:
+        try:
+            req = urllib.request.Request(hub_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                html = r.read().decode("utf-8", errors="ignore")
+            raw_links = re.findall(r'href=["\'](https?://[^"\'\s<>]+|/[^"\'\s<>]+)["\']', html)
+            for l in raw_links:
+                full = urljoin(hub_url, l).split("?")[0].split("#")[0]
+                parsed = urlparse(full)
+                if "yahoo.com" in parsed.netloc:
+                    path = parsed.path.lower()
+                    if ("/article/" in path or "/articles/" in path or path.endswith(".html")) and not any(skip in path for skip in ["/privacy", "/terms", "/help", "/disclaimer", "/screener", "/watchlists", "/compare"]):
+                        if not re.search(r"^/(topic|research-hub|sectors|markets)/?$", path):
+                            if full not in seen:
+                                seen.add(full)
+                                seeds.append({
+                                    "url": full,
+                                    "title": "",
+                                    "source": "Yahoo Finance",
+                                    "category": category,
+                                    "domain": "finance.yahoo.com"
+                                })
         except Exception:
             pass
 
